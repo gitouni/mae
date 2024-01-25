@@ -1,0 +1,8 @@
+phase: train
+dataset:
+  img_size: [480, 640]
+  img_trans: 'center_crop'  # chocies ['center_crop',' random_crop', 'resize', 'none']
+  data_path:
+  mask_path:
+  val_split: 0.2
+  seed: 0
