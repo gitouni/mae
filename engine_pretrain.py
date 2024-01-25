@@ -10,73 +10,164 @@
 # --------------------------------------------------------
 import math
 import sys
-from typing import Iterable
+import os
+from typing import Iterable, Union
 
 import torch
-
+import numpy as np
+from PIL import Image
+from torchvision.utils import make_grid
 import util.misc as misc
 import util.lr_sched as lr_sched
+from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+
+
+def tensor2img(tensor:torch.Tensor, out_type=np.uint8, mean_value:Union[float, Iterable]=IMAGENET_DEFAULT_MEAN, std_value:Union[float, Iterable]=IMAGENET_DEFAULT_STD):
+	'''
+	Converts a torch Tensor into an image Numpy array
+	Input: 4D(B,(3/1),H,W), 3D(C,H,W), or 2D(H,W), any range, RGB channel order
+	Output: 3D(H,W,C) or 2D(H,W), [0,255], np.uint8 (default)
+	'''
+	n_dim = tensor.dim()
+	if isinstance(mean_value, Iterable):
+		mean = np.array(mean_value)[None, None, :]  # (1,1,3)
+		std = np.array(std_value)[None, None, :]  # (1,1,3)
+	if n_dim == 4:
+		n_img = len(tensor)
+		img_np = make_grid(tensor, nrow=int(math.sqrt(n_img)), normalize=False).cpu().detach().numpy()
+		img_np = np.transpose(img_np, (1, 2, 0))  # HWC, RGB
+	elif n_dim == 3:
+		img_np = tensor.cpu().detach().numpy()
+		img_np = np.transpose(img_np, (1, 2, 0))  # HWC, RGB
+	elif n_dim == 2:
+		img_np = tensor.cpu().detach().numpy()
+		mean = 0
+		std = 1
+	else:
+		raise TypeError('Only support 4D, 3D and 2D tensor. But received with dimension: {:d}'.format(n_dim))
+	if out_type == np.uint8:
+		img_np = (((img_np * std) + mean) * 255).round()
+		# Important. Unlike matlab, numpy.unit8() WILL NOT round by default.
+	return img_np.astype(out_type).squeeze()
 
 
 def train_one_epoch(model: torch.nn.Module,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler,
-                    log_writer=None,
-                    args=None):
-    model.train(True)
-    metric_logger = misc.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 20
+					data_loader: Iterable, optimizer: torch.optim.Optimizer,
+					device: torch.device, epoch: int, loss_scaler,
+					log_writer=None,
+					args=None):
+	model.train(True)
+	metric_logger = misc.MetricLogger(delimiter="  ")
+	metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+	header = 'Epoch: [{}]'.format(epoch)
+	print_freq = args.print_freq
 
-    accum_iter = args.accum_iter
+	accum_iter = args.accum_iter
 
-    optimizer.zero_grad()
+	optimizer.zero_grad()
 
-    if log_writer is not None:
-        print('log_dir: {}'.format(log_writer.log_dir))
+	if log_writer is not None:
+		print('log_dir: {}'.format(log_writer.log_dir))
 
-    for data_iter_step, (samples, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+	for data_iter_step, (samples, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
-        # we use a per iteration (instead of per epoch) lr scheduler
-        if data_iter_step % accum_iter == 0:
-            lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
+		# we use a per iteration (instead of per epoch) lr scheduler
+		if data_iter_step % accum_iter == 0:
+			lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
-        samples = samples.to(device, non_blocking=True)
+		samples = samples.to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast():
-            loss, _, _ = model(samples, mask_ratio=args.mask_ratio)
+		with torch.cuda.amp.autocast():
+			loss, _, _ = model(samples, mask_ratio=args.mask_ratio)
 
-        loss_value = loss.item()
+		loss_value = loss.item()
 
-        if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
-            sys.exit(1)
+		if not math.isfinite(loss_value):
+			print("Loss is {}, stopping training".format(loss_value))
+			sys.exit(1)
 
-        loss /= accum_iter
-        loss_scaler(loss, optimizer, parameters=model.parameters(),
-                    update_grad=(data_iter_step + 1) % accum_iter == 0)
-        if (data_iter_step + 1) % accum_iter == 0:
-            optimizer.zero_grad()
+		loss /= accum_iter
+		loss_scaler(loss, optimizer, parameters=model.parameters(),
+					update_grad=(data_iter_step + 1) % accum_iter == 0)
+		if (data_iter_step + 1) % accum_iter == 0:
+			optimizer.zero_grad()
 
-        torch.cuda.synchronize()
+		torch.cuda.synchronize()
 
-        metric_logger.update(loss=loss_value)
+		metric_logger.update(loss=loss_value)
 
-        lr = optimizer.param_groups[0]["lr"]
-        metric_logger.update(lr=lr)
+		lr = optimizer.param_groups[0]["lr"]
+		metric_logger.update(lr=lr)
 
-        loss_value_reduce = misc.all_reduce_mean(loss_value)
-        if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
-            """ We use epoch_1000x as the x-axis in tensorboard.
-            This calibrates different curves when batch size changes.
-            """
-            epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
-            log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
-            log_writer.add_scalar('lr', lr, epoch_1000x)
+		loss_value_reduce = misc.all_reduce_mean(loss_value)
+		if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
+			""" We use epoch_1000x as the x-axis in tensorboard.
+			This calibrates different curves when batch size changes.
+			"""
+			epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
+			log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
+			log_writer.add_scalar('lr', lr, epoch_1000x)
 
 
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+	# gather the stats from all processes
+	metric_logger.synchronize_between_processes()
+	print("Averaged stats:", metric_logger)
+	return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+@torch.no_grad()
+def val_one_epoch(model: torch.nn.Module,
+					data_loader: Iterable, optimizer: torch.optim.Optimizer,
+					device: torch.device, epoch: int,
+					log_writer=None, save_dir:str='',
+					args=None):
+	model.eval()
+	metric_logger = misc.MetricLogger(delimiter="  ")
+	metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+	header = 'Epoch: [{}]'.format(epoch)
+	print_freq = args.print_freq
+
+	accum_iter = args.accum_iter
+
+	optimizer.zero_grad()
+
+	if log_writer is not None:
+		print('log_dir: {}'.format(log_writer.log_dir))
+	if os.path.isdir(save_dir):
+		curr_save_dir = os.path.join(save_dir, "%03d"%epoch)
+		gt_save_dir = os.path.join(curr_save_dir, 'gt')
+		pred_save_dir = os.path.join(curr_save_dir, 'pred')
+		mask_save_dir = os.path.join(curr_save_dir, 'mask')
+		os.makedirs(curr_save_dir,exist_ok=True)
+		os.makedirs(gt_save_dir, exist_ok=True)
+		os.makedirs(pred_save_dir, exist_ok=True)
+		os.makedirs(mask_save_dir, exist_ok=True)
+		print("val save_dir:{}".format(curr_save_dir))
+	save_cnt = 0
+	for data_iter_step, (samples, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+		# we use a per iteration (instead of per epoch) lr scheduler
+		samples = samples.to(device, non_blocking=True)
+		loss, pred, mask = model(samples, mask_ratio=args.mask_ratio)
+		if data_iter_step % accum_iter == 0:
+			pred = model.unpatchify(pred)
+			mask = model.unpatchify(mask, in_chans=1)
+			Image.fromarray(tensor2img(samples)).save(os.path.join(gt_save_dir, '%04d.%s'%(save_cnt, args.save_fmt)))
+			Image.fromarray(tensor2img(pred)).save(os.path.join(pred_save_dir, '%04d.%s'%(save_cnt, args.save_fmt)))
+			Image.fromarray(tensor2img(mask)).save(os.path.join(mask_save_dir, '%04d.%s'%(save_cnt, args.save_fmt)))
+		loss_value = loss.item()
+
+		torch.cuda.synchronize()
+
+		metric_logger.update(loss=loss_value)
+
+		loss_value_reduce = misc.all_reduce_mean(loss_value)
+		if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
+			""" We use epoch_1000x as the x-axis in tensorboard.
+			This calibrates different curves when batch size changes.
+			"""
+			epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
+			log_writer.add_scalar('val_loss', loss_value_reduce, epoch_1000x)
+
+	# gather the stats from all processes
+	metric_logger.synchronize_between_processes()
+	print("Averaged stats:", metric_logger)
+	return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
