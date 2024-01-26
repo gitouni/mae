@@ -116,7 +116,7 @@ def train_one_epoch(model: torch.nn.Module,
 
 @torch.no_grad()
 def val_one_epoch(model: torch.nn.Module,
-					data_loader: Iterable, optimizer: torch.optim.Optimizer,
+					data_loader: Iterable,
 					device: torch.device, epoch: int,
 					log_writer=None, save_dir:str='',
 					args=None):
@@ -127,8 +127,6 @@ def val_one_epoch(model: torch.nn.Module,
 	print_freq = args.print_freq
 
 	accum_iter = args.accum_iter
-
-	optimizer.zero_grad()
 
 	if log_writer is not None:
 		print('log_dir: {}'.format(log_writer.log_dir))
