@@ -19,7 +19,12 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from torch._six import inf
+import shutil
 
+def refresh_dir(dirname:str):
+    if os.path.isdir(dirname):
+        shutil.rmtree(dirname)
+    os.makedirs(dirname)
 
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
@@ -145,7 +150,7 @@ class MetricLogger(object):
             data_time.update(time.time() - end)
             yield obj
             iter_time.update(time.time() - end)
-            if i % print_freq == 0 or i == len(iterable) - 1:
+            if (i % print_freq == 0 or i == len(iterable) - 1) and i > 0:
                 eta_seconds = iter_time.global_avg * (len(iterable) - i)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
                 if torch.cuda.is_available():

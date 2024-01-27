@@ -82,7 +82,7 @@ def build_transform(is_train, args):
     return transforms.Compose(t)
 
 
-def find_imgs_indir(dirname:Union[str, Iterable[str]]):
+def find_imgs_indir(dirname:Union[str, Iterable]):
     if isinstance(dirname, str):
         filenames = [os.path.join(dirname,file) for file in sorted(os.listdir(dirname)) if is_image_file(file)]
         return filenames
@@ -111,6 +111,9 @@ class InpaintDataset(Dataset):
         mask = self.mask_loader(self.masks[index])
         return self.img_transform(img), self.mask_transform(mask)
 
+    def __len__(self):
+        return len(self.imgs)
+
 def subset_split(dataset, lengths, generator):
     """
     split a dataset into non-overlapping new datasets of given lengths. main code is from random_split function in pytorch
@@ -129,8 +132,8 @@ def make_dataset(opt:dict):
     dataset_args:dict = opt['dataset']
     img_size = dataset_args['img_size']
     general_transforms = []
-    if dataset_args['transform'] != 'none':
-        general_transforms.append(__transform_dict__[dataset_args['transform']](size=img_size))
+    if dataset_args['img_trans'] != 'none':
+        general_transforms.append(__transform_dict__[dataset_args['img_trans']](size=img_size))
     general_transforms.append(transforms.ToTensor())
     img_tf = transforms.Compose(general_transforms + [transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)])
     mask_tf = transforms.Compose(general_transforms)
@@ -176,7 +179,5 @@ def make_dataset(opt:dict):
             return ConcatDataset(train_dataset_list), ConcatDataset(val_dataset_list)
         else:
             return ConcatDataset(dataset_list)
-            
-    
-
-    
+    else:
+        raise NotImplementedError("data path must be Iterable or str")
