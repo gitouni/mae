@@ -20,7 +20,7 @@ from torchvision.utils import make_grid
 import util.misc as misc
 import util.lr_sched as lr_sched
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-
+from models_mae import MaskedAutoencoderViT
 
 def tensor2img(tensor:torch.Tensor, out_type=np.uint8, mean_value:Union[float, Iterable]=IMAGENET_DEFAULT_MEAN, std_value:Union[float, Iterable]=IMAGENET_DEFAULT_STD):
 	'''
@@ -51,9 +51,9 @@ def tensor2img(tensor:torch.Tensor, out_type=np.uint8, mean_value:Union[float, I
 	return img_np.astype(out_type).squeeze()
 
 
-def train_one_epoch(model: torch.nn.Module,
+def train_one_epoch(model: MaskedAutoencoderViT,
 					data_loader: Iterable, optimizer: torch.optim.Optimizer,
-					device: torch.device, epoch: int, loss_scaler,
+					device: torch.device, epoch: int, train_dict:dict,loss_scaler,
 					log_writer=None,
 					args=None):
 	model.train(True)
@@ -69,16 +69,25 @@ def train_one_epoch(model: torch.nn.Module,
 	if log_writer is not None:
 		print('log_dir: {}'.format(log_writer.log_dir))
 
-	for data_iter_step, (samples, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+	for data_iter_step, (samples) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
 		# we use a per iteration (instead of per epoch) lr scheduler
 		if data_iter_step % accum_iter == 0:
 			lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
-		samples = samples.to(device, non_blocking=True)
-
-		with torch.cuda.amp.autocast():
-			loss, _, _ = model(samples, mask_ratio=args.mask_ratio)
+		if train_dict['method'] == 'random_masking':
+			mask_ratio = train_dict['mask_ratio']
+			samples = samples.to(device)
+			with torch.autocast(device_type=str(device)):
+				loss, *_ = model(samples, mask_ratio=mask_ratio)
+		elif train_dict['method'] == 'fixed_masking':
+			img, mask = samples
+			img = img.to(device)
+			mask = mask.to(device)
+			with torch.autocast(device_type=str(device)):
+				loss, *_ = model.fixed_forward(img, mask)
+		else:
+			raise NotImplementedError("method must be 'random_masking' or 'fixed_masking', found {}".format(train_dict['method']))
 
 		loss_value = loss.item()
 
@@ -115,10 +124,10 @@ def train_one_epoch(model: torch.nn.Module,
 	return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 @torch.no_grad()
-def val_one_epoch(model: torch.nn.Module,
+def val_one_epoch(model: MaskedAutoencoderViT,
 					data_loader: Iterable,
-					device: torch.device, epoch: int,
-					log_writer=None, save_dir:str='',
+					device: torch.device, epoch: int, val_dict:dict,
+					log_writer=None,
 					args=None):
 	model.eval()
 	metric_logger = misc.MetricLogger(delimiter="  ")
@@ -130,8 +139,8 @@ def val_one_epoch(model: torch.nn.Module,
 
 	if log_writer is not None:
 		print('log_dir: {}'.format(log_writer.log_dir))
-	if os.path.isdir(save_dir):
-		curr_save_dir = os.path.join(save_dir, "%03d"%epoch)
+	if hasattr(args, 'save_dir') and os.path.isdir(args.save_dir):
+		curr_save_dir = os.path.join(args.save_dir, "%03d"%epoch)
 		gt_save_dir = os.path.join(curr_save_dir, 'gt')
 		pred_save_dir = os.path.join(curr_save_dir, 'pred')
 		mask_save_dir = os.path.join(curr_save_dir, 'mask')
@@ -141,16 +150,28 @@ def val_one_epoch(model: torch.nn.Module,
 		os.makedirs(mask_save_dir, exist_ok=True)
 		print("val save_dir:{}".format(curr_save_dir))
 	save_cnt = 0
-	for data_iter_step, (samples, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+	for data_iter_step, (samples) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 		# we use a per iteration (instead of per epoch) lr scheduler
-		samples = samples.to(device, non_blocking=True)
-		loss, pred, mask = model(samples, mask_ratio=args.mask_ratio)
-		if data_iter_step % accum_iter == 0:
+		if val_dict['method'] == 'random_masking':
+			mask_ratio = val_dict['mask_ratio']
+			samples = samples.to(device)
+			with torch.autocast(device_type=str(device)):
+				loss, pred, mask = model(samples, mask_ratio=mask_ratio)
+		elif val_dict['method'] == 'fixed_masking':
+			img, mask = samples
+			img = img.to(device)
+			mask = mask.to(device)
+			with torch.autocast(device_type=str(device)):
+				loss, pred, mask = model.fixed_forward(img, mask)
+		else:
+			raise NotImplementedError("method must be 'random_masking' or 'fixed_masking', found {}".format(val_dict['method']))
+		if data_iter_step % print_freq == 0:
 			pred = model.unpatchify(pred)
 			mask = model.unpatchify(mask, in_chans=1)
 			Image.fromarray(tensor2img(samples)).save(os.path.join(gt_save_dir, '%04d.%s'%(save_cnt, args.save_fmt)))
 			Image.fromarray(tensor2img(pred)).save(os.path.join(pred_save_dir, '%04d.%s'%(save_cnt, args.save_fmt)))
 			Image.fromarray(tensor2img(mask)).save(os.path.join(mask_save_dir, '%04d.%s'%(save_cnt, args.save_fmt)))
+			save_cnt += 1
 		loss_value = loss.item()
 
 		torch.cuda.synchronize()

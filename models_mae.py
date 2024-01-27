@@ -69,10 +69,10 @@ class MaskedAutoencoderViT(nn.Module):
     def initialize_weights(self):
         # initialization
         # initialize (and freeze) pos_embed by sin-cos embedding
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], self.grid_size[0], cls_token=self.use_cls_token)
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], self.grid_size, cls_token=self.use_cls_token)
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
-        decoder_pos_embed = get_2d_sincos_pos_embed(self.decoder_pos_embed.shape[-1], self.grid_size[0], cls_token=self.use_cls_token)
+        decoder_pos_embed = get_2d_sincos_pos_embed(self.decoder_pos_embed.shape[-1], self.grid_size, cls_token=self.use_cls_token)
         self.decoder_pos_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
 
         # initialize patch_embed like nn.Linear (instead of nn.Conv2d)
@@ -121,9 +121,10 @@ class MaskedAutoencoderViT(nn.Module):
         """
         ph, pw = self.patch_size
         h, w = self.grid_size
+        c = imgs.shape[1]
         x = imgs.reshape(shape=(imgs.shape[0], imgs.shape[1], h, ph, w, pw))
-        x = torch.einsum('nchpwq->nhwpqc', x)
-        x = x.reshape(shape=(imgs.shape[0], h * w, self.img_patch_dim))
+        x = torch.einsum('nchpwq->nhwpqc', x) # x.permute(0,2,4,3,5,1)
+        x = x.reshape(shape=(imgs.shape[0], h * w, ph*pw*c))
         return x
 
     def unpatchify(self, x:torch.Tensor, in_chans:Union[int, None]=None) -> torch.Tensor:
@@ -138,12 +139,13 @@ class MaskedAutoencoderViT(nn.Module):
         """
         if in_chans is None:
             in_chans = self.in_chans
+        N = x.shape[1]
         ph, pw = self.patch_size
         h, w = self.grid_size
-        assert h * w == x.shape[1]
-        x = x.reshape(shape=(x.shape[0], h, w, ph, pw, in_chans))
+        assert h * w == N
+        x = x.reshape(shape=(N, h, w, ph, pw, in_chans))
         x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], in_chans, h * ph, h * pw))
+        imgs = x.reshape(shape=(N, in_chans, h * ph, w * pw))
         return imgs
 
     def random_masking(self, x:torch.Tensor, mask_ratio:float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -247,6 +249,15 @@ class MaskedAutoencoderViT(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: x, mask, ids_restore
         """
+        # embed patches
+        x = self.patch_embed(x)
+
+        # add pos embed w/o cls token
+        if self.use_cls_token:
+            x = x + self.pos_embed[:, 1:, :]
+        else:
+            x = x + self.pos_embed
+        # masking: length -> length * mask_ratio
         N, L, D = x.shape  # batch, length, dim
         mask_ = mask.clone().detach()
         if mask_.ndim == 3:

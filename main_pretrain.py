@@ -39,7 +39,7 @@ from engine_pretrain import train_one_epoch, val_one_epoch
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE pre-training', add_help=False)
     parser.add_argument("--config", type=str,default="cfg/slip_tr.yml")
-    parser.add_argument('--batch_size', default=16, type=int,
+    parser.add_argument('--batch_size', default=4, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
     parser.add_argument('--epochs', default=400, type=int)
     parser.add_argument('--save_per_epochs',type=int,default=40)
@@ -50,7 +50,7 @@ def get_args_parser():
     parser.add_argument('--model', default='mae_vit_base_patch16_dec512d8b', type=str, metavar='MODEL',
                         help='Name of model to train')
 
-    parser.add_argument('--input_size', default=224, type=int,
+    parser.add_argument('--input_size', default=[480, 640], type=int, nargs="+",
                         help='images input size')
 
     parser.add_argument('--mask_ratio', default=0.7, type=float,
@@ -64,7 +64,7 @@ def get_args_parser():
     parser.add_argument('--weight_decay', type=float, default=0.05,
                         help='weight decay (default: 0.05)')
 
-    parser.add_argument('--lr', type=float, default=None, metavar='LR',
+    parser.add_argument('--lr', type=float, default=0.001, metavar='LR',
                         help='learning rate (absolute lr)')
     parser.add_argument('--blr', type=float, default=1e-3, metavar='LR',
                         help='base learning rate: absolute_lr = base_lr * total_batch_size / 256')
@@ -116,8 +116,9 @@ def main(args):
     print("{}".format(args).replace(', ', ',\n'))
 
     device = torch.device(args.device)
-    config = yaml.load(args.config, yaml.SafeLoader)
+    config = yaml.load(open(args.config, 'r'), yaml.SafeLoader)
     img_size = config['dataset']['img_size']
+
     # fix the seed for reproducibility
     seed = args.seed + misc.get_rank()
     torch.manual_seed(seed)
@@ -126,10 +127,11 @@ def main(args):
     cudnn.benchmark = True
 
     train_dataset, val_dataset = make_dataset(config)
-
+    train_args = config['runtime']['train']
+    val_args = config['runtime']['val']
+    num_tasks = misc.get_world_size()
+    global_rank = misc.get_rank()
     if args.distributed:
-        num_tasks = misc.get_world_size()
-        global_rank = misc.get_rank()
         sampler_train = torch.utils.data.DistributedSampler(
             train_dataset, num_replicas=num_tasks, rank=global_rank, shuffle=True
         )
@@ -156,14 +158,12 @@ def main(args):
             train_dataset, batch_size=args.batch_size,
             shuffle=True,
             num_workers=args.num_workers,
-            num_workers=args.num_workers,
             pin_memory=args.pin_mem,
             drop_last=True)
         
         data_loader_val = DataLoader(
             train_dataset, batch_size=1,
             shuffle=False,
-            num_workers=args.num_workers,
             num_workers=args.num_workers,
             pin_memory=args.pin_mem,
             drop_last=False)
@@ -213,7 +213,7 @@ def main(args):
             data_loader_train.sampler.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, data_loader_train,
-            optimizer, device, epoch, loss_scaler,
+            optimizer, device, epoch, train_args, loss_scaler,
             log_writer=log_writer,
             args=args
         )
@@ -228,7 +228,7 @@ def main(args):
         if epoch % args.save_per_epochs == 0 or epoch + 1 == args.epochs:
             val_stats = val_one_epoch(
                 model, data_loader_val,
-                device, epoch, log_writer, args.save_dir, args
+                device, epoch, val_args, log_writer, args
             )
             val_log_states = {**{f'val_{k}': v for k, v in val_stats.items()},
                         'epoch': epoch,}
