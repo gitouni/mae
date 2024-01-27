@@ -121,10 +121,11 @@ class MaskedAutoencoderViT(nn.Module):
         """
         ph, pw = self.patch_size
         h, w = self.grid_size
+        N = imgs.shape[0]
         c = imgs.shape[1]
-        x = imgs.reshape(shape=(imgs.shape[0], imgs.shape[1], h, ph, w, pw))
+        x = imgs.reshape(shape=(N, c, h, ph, w, pw))
         x = torch.einsum('nchpwq->nhwpqc', x) # x.permute(0,2,4,3,5,1)
-        x = x.reshape(shape=(imgs.shape[0], h * w, ph*pw*c))
+        x = x.reshape(shape=(N, h * w, ph*pw*c))
         return x
 
     def unpatchify(self, x:torch.Tensor, in_chans:Union[int, None]=None) -> torch.Tensor:
@@ -139,10 +140,10 @@ class MaskedAutoencoderViT(nn.Module):
         """
         if in_chans is None:
             in_chans = self.in_chans
-        N = x.shape[1]
+        N = x.shape[0]
         ph, pw = self.patch_size
         h, w = self.grid_size
-        assert h * w == N
+        assert h * w == x.shape[1]
         x = x.reshape(shape=(N, h, w, ph, pw, in_chans))
         x = torch.einsum('nhwpqc->nchpwq', x)
         imgs = x.reshape(shape=(N, in_chans, h * ph, w * pw))

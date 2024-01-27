@@ -32,6 +32,9 @@ def tensor2img(tensor:torch.Tensor, out_type=np.uint8, mean_value:Union[float, I
 	if isinstance(mean_value, Iterable):
 		mean = np.array(mean_value)[None, None, :]  # (1,1,3)
 		std = np.array(std_value)[None, None, :]  # (1,1,3)
+	else:
+		mean = mean_value
+		std = std_value
 	if n_dim == 4:
 		n_img = len(tensor)
 		img_np = make_grid(tensor, nrow=int(math.sqrt(n_img)), normalize=False).cpu().detach().numpy()
@@ -41,12 +44,11 @@ def tensor2img(tensor:torch.Tensor, out_type=np.uint8, mean_value:Union[float, I
 		img_np = np.transpose(img_np, (1, 2, 0))  # HWC, RGB
 	elif n_dim == 2:
 		img_np = tensor.cpu().detach().numpy()
-		mean = 0
-		std = 1
 	else:
 		raise TypeError('Only support 4D, 3D and 2D tensor. But received with dimension: {:d}'.format(n_dim))
 	if out_type == np.uint8:
-		img_np = (((img_np * std) + mean) * 255).round()
+		img_np = (img_np * std) + mean
+		img_np = (np.clip(img_np, 0, 1) * 255).round()
 		# Important. Unlike matlab, numpy.unit8() WILL NOT round by default.
 	return img_np.astype(out_type).squeeze()
 
@@ -70,7 +72,6 @@ def train_one_epoch(model: MaskedAutoencoderViT,
 		print('log_dir: {}'.format(log_writer.log_dir))
 
 	for data_iter_step, (samples) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-
 		# we use a per iteration (instead of per epoch) lr scheduler
 		if data_iter_step % accum_iter == 0:
 			lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
@@ -131,7 +132,6 @@ def val_one_epoch(model: MaskedAutoencoderViT,
 					args=None):
 	model.eval()
 	metric_logger = misc.MetricLogger(delimiter="  ")
-	metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
 	header = 'Epoch: [{}]'.format(epoch)
 	print_freq = args.print_freq
 
@@ -139,7 +139,8 @@ def val_one_epoch(model: MaskedAutoencoderViT,
 
 	if log_writer is not None:
 		print('log_dir: {}'.format(log_writer.log_dir))
-	if hasattr(args, 'save_dir') and os.path.isdir(args.save_dir):
+	if hasattr(args, 'save_dir'):
+		save_flag = True
 		curr_save_dir = os.path.join(args.save_dir, "%03d"%epoch)
 		gt_save_dir = os.path.join(curr_save_dir, 'gt')
 		pred_save_dir = os.path.join(curr_save_dir, 'pred')
@@ -149,29 +150,33 @@ def val_one_epoch(model: MaskedAutoencoderViT,
 		os.makedirs(pred_save_dir, exist_ok=True)
 		os.makedirs(mask_save_dir, exist_ok=True)
 		print("val save_dir:{}".format(curr_save_dir))
-	save_cnt = 0
+		save_cnt = 0
+	else:
+		save_flag = False
 	for data_iter_step, (samples) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 		# we use a per iteration (instead of per epoch) lr scheduler
 		if val_dict['method'] == 'random_masking':
 			mask_ratio = val_dict['mask_ratio']
-			samples = samples.to(device)
+			img:torch.Tensor = samples.to(device)
 			with torch.autocast(device_type=str(device)):
 				loss, pred, mask = model(samples, mask_ratio=mask_ratio)
 		elif val_dict['method'] == 'fixed_masking':
 			img, mask = samples
-			img = img.to(device)
-			mask = mask.to(device)
+			img:torch.Tensor = img.to(device)
+			mask:torch.Tensor = mask.to(device)
 			with torch.autocast(device_type=str(device)):
 				loss, pred, mask = model.fixed_forward(img, mask)
 		else:
 			raise NotImplementedError("method must be 'random_masking' or 'fixed_masking', found {}".format(val_dict['method']))
-		if data_iter_step % print_freq == 0:
-			pred = model.unpatchify(pred)
-			mask = model.unpatchify(mask, in_chans=1)
-			Image.fromarray(tensor2img(samples)).save(os.path.join(gt_save_dir, '%04d.%s'%(save_cnt, args.save_fmt)))
-			Image.fromarray(tensor2img(pred)).save(os.path.join(pred_save_dir, '%04d.%s'%(save_cnt, args.save_fmt)))
-			Image.fromarray(tensor2img(mask)).save(os.path.join(mask_save_dir, '%04d.%s'%(save_cnt, args.save_fmt)))
+		if save_flag and (data_iter_step % print_freq == 0):
+			pred = model.unpatchify(pred) # (N, H, W)
+			mask = mask[...,None].repeat(1, 1, model.patch_size[0]*model.patch_size[1])  # (N, L) -> (N, L, D)
+			mask = model.unpatchify(mask, in_chans=1) # (N, H, W)
+			Image.fromarray(tensor2img(img)).save(os.path.join(gt_save_dir, '%04d.%s'%(save_cnt, args.save_fmt)))
+			Image.fromarray(tensor2img(pred * mask + img * (1-mask))).save(os.path.join(pred_save_dir, '%04d.%s'%(save_cnt, args.save_fmt)))
+			Image.fromarray(tensor2img(mask, mean_value=0., std_value=1.)).save(os.path.join(mask_save_dir, '%04d.%s'%(save_cnt, args.save_fmt)))
 			save_cnt += 1
+		
 		loss_value = loss.item()
 
 		torch.cuda.synchronize()
