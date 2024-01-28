@@ -20,14 +20,13 @@ from pathlib import Path
 import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
+# import torchvision.transforms as transforms
+# import torchvision.datasets as datasets
 from torch.utils.data import DataLoader
 # import timm
 
 # assert timm.__version__ == "0.3.2"  # version check
 import timm.optim.optim_factory as optim_factory
-
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from util.datasets import make_dataset
@@ -41,8 +40,8 @@ def get_args_parser():
     parser.add_argument("--config", type=str,default="cfg/slip_tr.yml")
     parser.add_argument('--batch_size', default=4, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--epochs', default=400, type=int)
-    parser.add_argument('--save_per_epochs',type=int,default=40)
+    parser.add_argument('--epochs', default=800, type=int)
+    parser.add_argument('--save_per_epochs',type=int,default=80)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
@@ -55,7 +54,7 @@ def get_args_parser():
 
     parser.add_argument('--mask_ratio', default=0.7, type=float,
                         help='Masking ratio (percentage of removed patches).')
-
+    parser.add_argument("--masking_method", type=str, nargs="+", defualt=['random_masking', 'fixed_masking'])
     parser.add_argument('--norm_pix_loss', action='store_true',
                         help='Use (per-patch) normalized pixels as targets for computing loss')
     parser.set_defaults(norm_pix_loss=False)
@@ -75,15 +74,15 @@ def get_args_parser():
                         help='epochs to warmup LR')
     parser.add_argument("--print_freq", type=int, default=20)
     parser.add_argument("--save_fmt", type=str, default='.png')
-    # Dataset parameters
-    parser.add_argument('--data_path', default='data/', type=str,
-                        help='dataset path')
+    # Dataset parameters (replaced by the config yaml)
+    # parser.add_argument('--data_path', default='data/', type=str,
+    #                     help='dataset path')
 
-    parser.add_argument('--output_dir', default='./exp',
+    parser.add_argument('--output_dir', default='./exp/no_gan',
                         help='path where to save, empty for no saving')
-    parser.add_argument('--log_dir', default='./log',
+    parser.add_argument('--log_dir', default='./log/no_gan',
                         help='path where to tensorboard log')
-    parser.add_argument("--save_dir",type=str,default="./log_imgs")
+    parser.add_argument("--save_dir",type=str,default="./log_imgs/no_gan")
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
@@ -97,6 +96,11 @@ def get_args_parser():
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
     parser.set_defaults(pin_mem=True)
+
+    parser.add_argument("--use_gan", action='store_true')
+    parser.add_argument("--no_gan", action='store_false', dest='use_gan')
+    parser.add_argument("--disc_weight", type=float, default=2.0)
+    parser.set_defaults(use_gan=False)
 
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
@@ -176,12 +180,12 @@ def main(args):
 
     
     # define the model
-    model:models_mae.MaskedAutoencoderViT = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss,img_size=img_size)
+    model:models_mae.MaskedAutoencoderViT = models_mae.__dict__[args.model](img_size=img_size,norm_pix_loss=args.norm_pix_loss,use_gan=args.use_gan)
 
     model.to(device)
 
     model_without_ddp = model
-    print("Model = %s" % str(model_without_ddp))
+    print("Model = %s" % args.model)
 
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
     
@@ -204,13 +208,18 @@ def main(args):
     print(optimizer)
     loss_scaler = NativeScaler()
 
-    misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
+    misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler) # args.resume used here
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
-    misc.refresh_dir(args.log_dir)
-    misc.refresh_dir(args.save_dir)
-    misc.refresh_dir(args.output_dir)
+    if args.resume == '':
+        misc.refresh_dir(args.log_dir)
+        misc.refresh_dir(args.save_dir)
+        misc.refresh_dir(args.output_dir)
+    else:
+        os.makedirs(args.log_dir, exist_ok=True)
+        os.makedirs(args.save_dir, exist_ok=True)
+        os.makedirs(args.output_dir, exist_ok=True)
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)

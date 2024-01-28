@@ -25,14 +25,14 @@ class MaskedAutoencoderViT(nn.Module):
     def __init__(self, img_size:Union[int, Tuple[int]]=224, patch_size:Union[int, Tuple[int]]=16, in_chans=3,
                  embed_dim=1024, depth=24, num_heads=16,
                  decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
-                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False, use_cls_token=False):
+                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False, use_cls_token=False, use_gan=False):
         super().__init__()
 
         # --------------------------------------------------------------------------
         # MAE encoder specifics
         self.in_chans = in_chans
         self.use_cls_token = use_cls_token
-
+        self.use_gan = use_gan
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)  # Input can be non-squared image or patch
         num_patches = self.patch_embed.num_patches
         total_num_patches = num_patches + 1 if use_cls_token else num_patches
@@ -45,7 +45,8 @@ class MaskedAutoencoderViT(nn.Module):
             for _ in range(depth)])
         self.norm = norm_layer(embed_dim)
         # --------------------------------------------------------------------------
-
+        # Discriminator Specifics
+        self.discriminate = nn.Linear(embed_dim, 1, bias = True)
         # --------------------------------------------------------------------------
         # MAE decoder specifics
         self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
@@ -204,6 +205,82 @@ class MaskedAutoencoderViT(nn.Module):
         # unshuffle to get the binary mask
         mask = torch.gather(mask, dim=1, index=ids_restore)
         return x_masked, mask, ids_restore
+    
+    def discriminator(self, currupt_img:torch.Tensor):
+        """patch-based discrimator
+
+        Args:
+            currupt_img (torch.Tensor): x_pred * mask + x_gt * (1 - mask)
+
+        Returns:
+            _type_: _description_
+        """
+        x = self.patch_embed(currupt_img)
+        # print("after patch embed = "+str(x.size()))
+        # add pos embed w/o cls token
+        if self.use_cls_token:
+            x = x + self.pos_embed[:, 1:, :]
+        else:
+            x = x + self.pos_embed
+        # masking: length -> length * mask_ratio
+        # x, mask, ids_restore = self.random_masking(x, mask_ratio)
+        # append cls token
+        if self.use_cls_token:
+            cls_token = self.cls_token + self.pos_embed[:, :1, :]
+            cls_tokens = cls_token.expand(x.shape[0], -1, -1)
+            x = torch.cat((cls_tokens, x), dim=1)
+
+        # apply Transformer blocks
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)
+
+        # x = x.view(x.size(0), -1)
+
+        x = self.discriminate(x)
+        return torch.sigmoid(x)
+    
+
+    def discriminator_loss(self, x:torch.Tensor, mask:torch.Tensor):
+        """discriminator loss
+
+        Args:
+            x (torch.Tensor): (N, C, H, W)
+            mask (torch.Tensor): (N, L)
+
+        Returns:
+            torch.Tensor: BCE loss (1,)
+        """
+        # Real and fake discriminator outputs
+        output = self.discriminator(x)
+        if self.use_cls_token:
+            output = output[:, 1:, 0] 
+        else:
+            output = output[...,0]  # (N, L, 1) -> (N, L)
+        target = 1 - mask
+        target = target.float()
+
+        disc_loss = torch.nn.BCELoss(reduction='mean')
+        return disc_loss(output, target)
+    
+
+    def adv_loss(self, currupt_img:torch.Tensor, mask:torch.Tensor):
+        target = 1 - mask  # This flips the mask values
+        output = self.discriminator(currupt_img)
+        if self.use_cls_token:
+            disc_preds = output[:, 1:, 0]
+        else:
+            disc_preds = output[...,0]
+        # Reshape target to match the discriminator output shape
+        target = target.view(disc_preds.shape)
+        target = target.float()
+
+        # Calculate the number of correct predictions for original and reconstructed patches
+        corr_orig = (torch.log(disc_preds + 1e-8) * target).sum()/(target.sum())
+        corr_recons = (torch.log((1-disc_preds + 1e-8))*(1 - target)).sum()/((1-target).sum())
+        # print(corr_orig)
+        # print(corr_orig + corr_recons)
+        return (corr_orig) + (corr_recons) 
 
     def forward_encoder(self, x:torch.Tensor, mask_ratio:float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """forward encoder with random masking
@@ -326,17 +403,51 @@ class MaskedAutoencoderViT(nn.Module):
         loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         return loss
 
-    def forward(self, imgs:torch.Tensor, mask_ratio=0.75):
+    def forward(self, imgs:torch.Tensor, mask_ratio=0.75, use_gan:Union[None, bool] = None):
         latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
-        pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
-        loss = self.forward_loss(imgs, pred, mask)
-        return loss, pred, mask
+        pred = self.forward_decoder(latent, ids_restore)  # [N, L, D]
+        mae_loss = self.forward_loss(imgs, pred, mask)
+        if use_gan is None: # set use_gan to false during inference
+            use_gan = self.use_gan
+        if not use_gan:
+            return mae_loss, pred, mask
+        # loss = loss + self.adaptive_weight()*self.adv_loss()
+        ### 
+        # currupt_img = reconstructed masked patches + unmasked patches
+        img_patched = self.patchify(imgs)  # （N, L, D)
+        currupt_img = torch.zeros(img_patched.size())
+        mask1 = mask.unsqueeze(-1).expand_as(pred) # (N, L) -> (N, L, 1) -> (N, L, D)
+        currupt_img = torch.where(mask1 == 1, pred, img_patched)
+        currupt_img = self.unpatchify(currupt_img)
+        ###
 
-    def fixed_forward(self, imgs:torch.Tensor, masks:torch.Tensor):
+        disc_loss = self.discriminator_loss(currupt_img, mask)
+        adv_loss = self.adv_loss(currupt_img, mask)
+
+        return mae_loss, pred, mask, disc_loss, adv_loss, currupt_img
+
+    def fixed_forward(self, imgs:torch.Tensor, masks:torch.Tensor, use_gan:Union[None, bool] = None):
         latent, mask, ids_restore = self.inference_encoder(imgs, masks)
         pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
-        loss = self.forward_loss(imgs, pred, mask)
-        return loss, pred, mask
+        mae_loss = self.forward_loss(imgs, pred, mask)
+        if use_gan is None:  # set use_gan to false during inference
+            use_gan = self.use_gan
+        if not use_gan:
+            return mae_loss, pred, mask
+        # loss = loss + self.adaptive_weight()*self.adv_loss()
+        ### 
+        # currupt_img = reconstructed masked patches + unmasked patches
+        img_patched = self.patchify(imgs)
+        currupt_img = torch.zeros(img_patched.size())
+        mask1 = mask.unsqueeze(-1).expand_as(pred)
+        currupt_img = torch.where(mask1 == 1, pred, img_patched)
+        currupt_img = self.unpatchify(currupt_img)
+        ###
+
+        disc_loss = self.discriminator_loss(currupt_img, mask)
+        adv_loss = self.adv_loss(currupt_img, mask)
+
+        return mae_loss, pred, mask, disc_loss, adv_loss, currupt_img
 
 def mae_vit_base_patch16_dec512d8b(**kwargs):
     model = MaskedAutoencoderViT(
