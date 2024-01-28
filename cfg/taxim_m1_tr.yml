@@ -2,8 +2,8 @@ phase: train
 dataset:
   img_size: [480, 640]
   img_trans: center_crop  # chocies ['center_crop',' random_crop', 'resize', 'none']
-  data_path: dataset/slip_sp/TELEA
-  mask_path: dataset/slip_sp/marker
+  data_path: /home/bit/CODE/Research/GenerativeModel/Palette-Image-to-Image-Diffusion-Models-main/results/taxim_m1/TELEA
+  mask_path: dataset/taxim/marker_offset
   val_split: 0.2
   seed: 0
 
